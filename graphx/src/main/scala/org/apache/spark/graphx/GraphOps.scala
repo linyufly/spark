@@ -408,6 +408,16 @@ class GraphOps[VD: ClassTag, ED: ClassTag](graph: Graph[VD, ED]) extends Seriali
   }
 
   /**
+   * Run HyperlinkInducedTopicSearch for a fixed number of iterations returning a graph with
+   * vertex attributes containing the (hub score, authority score). Edge attribute is Null.
+   *
+   * @see [[org.apache.spark.graphx.lib.HyperlinkInducedTopicSearch$#run]]
+   */
+  def staticHyperlinkInducedTopicSearch(numIter: Int): Graph[(Double, Double), Null] = {
+    HyperlinkInducedTopicSearch.run(graph, numIter)
+  }
+
+  /**
    * Compute the connected component membership of each vertex and return a graph with the vertex
    * value containing the lowest vertex id in the connected component containing that vertex.
    *
