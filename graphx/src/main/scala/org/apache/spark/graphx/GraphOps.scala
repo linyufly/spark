@@ -413,7 +413,8 @@ class GraphOps[VD: ClassTag, ED: ClassTag](graph: Graph[VD, ED]) extends Seriali
    *
    * @see [[org.apache.spark.graphx.lib.HyperlinkInducedTopicSearch$#run]]
    */
-  def staticHyperlinkInducedTopicSearch(numIter: Int): Graph[(Double, Double), Null] = {
+  def staticHyperlinkInducedTopicSearch(numIter: Int):
+      Graph[HyperlinkInducedTopicSearch.Score, Null] = {
     HyperlinkInducedTopicSearch.run(graph, numIter)
   }
 

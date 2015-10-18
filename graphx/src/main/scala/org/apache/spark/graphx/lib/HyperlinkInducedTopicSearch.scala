@@ -17,98 +17,119 @@
 
 package org.apache.spark.graphx.lib
 
-import scala.language.postfixOps
 import scala.reflect.ClassTag
 
 import org.apache.spark.Logging
 import org.apache.spark.graphx._
 
 /**
- * HyperlinkInducedTopicSearch algorithm implementation using the standalone [[Graph]]
- * interface and running for a fixed number of iterations:
+ * Hyperlink-Induced Topic Search (HITS) algorithm implementation using the standalone
+ * [[Graph]] interface and running for a fixed number of iterations, where each vertex
+ * attribute has (hub, authority) as a pair of Double:
  * {{{
  * var HITS = Array.fill(n)((1.0, 1.0))
  * var oldHITS = Array.fill(n)((1.0, 1.0))
  * for( iter <- 0 until numIter ) {
- * swap(oldHITS, HITS)
- * for( i <- 0 until n) {
- * HITS[i] = (outNbrs[i].map(j => oldHITS[j]._2).sum,
- * inNbrs[i].map(j => oldHITS[j]._1).sum)
- * }
- * normalize(HITS)
+ *   swap(oldHITS, HITS)
+ *   for( i <- 0 until n) {
+ *     HITS[i] = (
+ *         hub = outNbrs[i].map(j => oldHITS[j].auth).sum,
+ *         auth = inNbrs[i].map(j => oldHITS[j].hub).sum)
+ *   }
+ *   normalize(HITS)
  * }
  * }}}
  *
- * Note that each vertex attribute has (hub, authority) as a pair of Double.
+ * The original paper is "Authoritative sources in a hyperlinked environment" by Jon
+ * Kleinberg (1999) published in the Journal of the ACM 46 (5): 604-632.
  */
 
 object HyperlinkInducedTopicSearch extends Logging {
+  case class Score(hub: Double, auth: Double)
+
   /**
-   * Run HyperlinkInducedTopicSearch for a fixed number of iterations returning
-   * a graph with vertex attributes containing (hub, authority) and null edge
-   * attributes.
+   * Run HITS for a fixed number of iterations returning a graph with vertex attributes
+   * containing (hub, authority) and null edge attributes.
    *
    * @tparam VD the original vertex attribute (not used)
    * @tparam ED the original edge attribute (not used)
    *
-   * @param graph the graph on which to compute HyperlinkInducedTopicSearch
-   * @param numIter the number of iterations of HyperlinkInducedTopicSearch to run
+   * @param graph the graph on which to compute HITS
+   * @param numIter the number of iterations of HITS to run
    *
    * @return the graph containing with each vertex containing (hub, authority) and
    *         null edge attributes.
    */
   def run[VD: ClassTag, ED: ClassTag](
-      graph: Graph[VD, ED], numIter: Int): Graph[(Double, Double), Null] = {
+      graph: Graph[VD, ED], numIter: Int): Graph[Score, Null] = {
     // Initialize the HubAuth graph with null edge attribute and each vertex with
-    // (1.0, 1.0), where the first is hub score, and the second is auth score.
-    var hubAuthGraph: Graph[(Double, Double), Null] = graph
-        .mapVertices((_, _) => (1.0, 1.0)).mapEdges(e => null)
+    // (hub = 1.0, auth = 1.0).
+    var hubAuthGraph: Graph[Score, Null] = graph
+        .mapVertices((_, _) => Score(hub = 1.0, auth = 1.0)).mapEdges(e => null).cache()
 
     var iteration = 0
-    var prevHubAuthGraph: Graph[(Double, Double), Null] = null
+    var prevHubAuthGraph: Graph[Score, Null] = null
 
     while (iteration < numIter) {
-      hubAuthGraph.cache()
-
-      // Compute the sum of hub score from incoming edges and the sum of auth score
-      // from outgoing edges for each vertex.
-      var hubAuthUpdates = hubAuthGraph.aggregateMessages[(Double, Double)](
+      // Update the hub score from outgoing edges.
+      val hubUpdates = hubAuthGraph.aggregateMessages[Double](
           ctx => {
-            ctx.sendToSrc(ctx.dstAttr._2, 0.0)
-            ctx.sendToDst(0.0, ctx.srcAttr._1)
+            ctx.sendToSrc(ctx.dstAttr.auth)
           },
-          (a, b) => (a._1 + b._1, a._2 + b._2)
+          _ + _,
+          TripletFields.Dst
       )
 
-      // norm is used for normalization, which is (hub norm, auth norm).
-      var norm = hubAuthUpdates.map(v => v._2)
-          .map(p => (p._1 * p._1, p._2 * p._2))
-          .reduce((a, b) => (a._1 + b._1, a._2 + b._2))
-
-      // If norm is (0.0, 0.0), set it to (1.0, 1.0) to prevent division by zero.
-      norm = if (norm._1 + norm._2 == 0.0) {
-        (1.0, 1.0)
-      } else {
-        (Math.sqrt(norm._1), Math.sqrt(norm._2))
-      }
-
-      // Apply the final (hub score, auth score) updates to get the new HubAuth,
-      // using join to preserve scores of vertices that did not receive a message.
       prevHubAuthGraph = hubAuthGraph
-      hubAuthGraph = hubAuthGraph.joinVertices(hubAuthUpdates) {
-        (id, oldSum, newSum) => (newSum._1 / norm._1, newSum._2 / norm._2)
+      hubAuthGraph = hubAuthGraph.mapVertices((_, _) => Score(hub = 0.0, auth = 0.0))
+          .joinVertices(hubUpdates) {
+        (id, oldScore, newHub) => Score(hub = newHub, auth = oldScore.auth)
       }.cache()
+      hubAuthGraph.vertices.count  // materialization
+      prevHubAuthGraph.vertices.unpersist(false)
 
-      hubAuthGraph.vertices.foreachPartition(v => {})  // materialization
-      hubAuthGraph.edges.foreachPartition(e => {})  // materialization
+      // Update the auth score from incoming edges.
+      val authUpdates = hubAuthGraph.aggregateMessages[Double](
+          ctx => {
+            ctx.sendToDst(ctx.srcAttr.hub)
+          },
+          _ + _,
+          TripletFields.Src
+      )
+
+      prevHubAuthGraph = hubAuthGraph
+      hubAuthGraph = hubAuthGraph.mapVertices((id, score) => Score(hub = score.hub, auth = 0.0))
+          .joinVertices(authUpdates) {
+        (id, oldScore, newAuth) => Score(hub = oldScore.hub, auth = newAuth)
+      }.cache()
+      hubAuthGraph.vertices.count  // materialization
+      prevHubAuthGraph.vertices.unpersist(false)
 
       logInfo(s"HyperlinkInducedTopicSearch finished iteration $iteration.")
 
-      prevHubAuthGraph.vertices.unpersist(false)
-      prevHubAuthGraph.edges.unpersist(false)
-
       iteration += 1
     }
+
+    // norm is used for normalization, which is (hub norm, auth norm).
+    var norm = hubAuthGraph.vertices.map(v => v._2)
+        .map(p => Score(hub = p.hub * p.hub, auth = p.auth * p.auth))
+        .reduce((a, b) => Score(hub = a.hub + b.hub, a.auth + b.auth))
+
+    // norm becomes (0.0, 0.0) iff the graph has no edges, and it should be set to (1.0, 1.0)
+    // to prevent division by zero. In other cases, both norm.hub and norm.auth should be
+    // larger than zero, as the initial hub and auth is set to 1 for every vertex.
+    norm = if (norm.hub + norm.auth == 0.0) {
+      Score(hub = 1.0, auth = 1.0)
+    } else {
+      Score(hub = math.sqrt(norm.hub), auth = math.sqrt(norm.auth))
+    }
+
+    // Normalization
+    prevHubAuthGraph = hubAuthGraph
+    hubAuthGraph = hubAuthGraph.mapVertices(
+        (id, score) => Score(hub = score.hub / norm.hub, auth = score.auth / norm.auth)).cache()
+    hubAuthGraph.vertices.count  // materialization
+    prevHubAuthGraph.vertices.unpersist(false)
 
     hubAuthGraph
   }
